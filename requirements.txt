@@ -1,3 +1,1 @@
-flask
-requests
-gunicorn
+flask\nrequests\ngunicorn\nedge-tts\nimageio-ffmpeg\n
