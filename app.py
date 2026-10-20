@@ -21,8 +21,9 @@ app = Flask(__name__)
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_BASE = "https://api.groq.com/openai/v1"
 
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3-turbo")
-WHISPER_LANG = os.environ.get("WHISPER_LANG", "en")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
+# Khali = auto-detect (Hindi + English dono). Sirf Hindi: "hi", sirf English: "en"
+WHISPER_LANG = os.environ.get("WHISPER_LANG", "").strip()
 # LLM: jo model aapke Groq account me chale wahi use hoga (upar se neeche try karta hai).
 # Pasandida model force karna ho to Render env me LLM_MODEL=model-name daalo.
 _DEFAULT_LLMS = [
@@ -41,12 +42,16 @@ working_model = None   # jo model chal gaya, usse yaad rakho
 # TTS: "edge" pehle, fail ho to "groq". Order badalna ho to env me TTS_ORDER=groq,edge
 TTS_ORDER = [p.strip() for p in os.environ.get("TTS_ORDER", "edge,groq").split(",") if p.strip()]
 EDGE_VOICE = os.environ.get("EDGE_VOICE", "en-US-AriaNeural")
+HINDI_VOICE = os.environ.get("HINDI_VOICE", "hi-IN-SwaraNeural")
+DEVANAGARI = re.compile(r"[\u0900-\u097F]")
 GROQ_TTS_MODEL = os.environ.get("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
 GROQ_TTS_VOICE = os.environ.get("GROQ_TTS_VOICE", "autumn")
 TTS_RATE = 24000   # ESP32 SPEAKER_RATE se match
 
 SYSTEM_PROMPT = (
     "You are ROBONEX AI, a friendly voice assistant inside a small robot. "
+    "Reply in the same language the user spoke. If the user speaks Hindi or Hinglish, "
+    "reply in Hindi written in Devanagari script. If the user speaks English, reply in English. "
     "Answer in 1 to 3 short sentences, plain text only. "
     "No markdown, no lists, no emojis, no asterisks."
 )
@@ -87,7 +92,8 @@ def clean_text(s):
 # ---------------- TTS providers ----------------
 async def _edge_mp3(text):
     import edge_tts
-    comm = edge_tts.Communicate(text, EDGE_VOICE)
+    voice = HINDI_VOICE if DEVANAGARI.search(text) else EDGE_VOICE
+    comm = edge_tts.Communicate(text, voice)
     buf = bytearray()
     async for ch in comm.stream():
         if ch["type"] == "audio":
@@ -126,6 +132,13 @@ def tts_groq(text):
 
 
 PROVIDERS = {"edge": tts_edge, "groq": tts_groq}
+
+
+def stt_fields():
+    d = {"model": WHISPER_MODEL, "response_format": "json", "temperature": "0"}
+    if WHISPER_LANG:
+        d["language"] = WHISPER_LANG
+    return d
 
 
 # ---------------- LLM with model fallback ----------------
@@ -189,8 +202,7 @@ def transcribe():
         GROQ_BASE + "/audio/transcriptions",
         headers={"Authorization": "Bearer " + GROQ_KEY},
         files={"file": ("voice.wav", data, "audio/wav")},
-        data={"model": WHISPER_MODEL, "response_format": "json",
-              "language": WHISPER_LANG, "temperature": "0"},
+        data=stt_fields(),
         timeout=60,
     )
     if r.status_code != 200:
@@ -235,6 +247,8 @@ def speak():
         fn = PROVIDERS.get(name)
         if not fn:
             continue
+        if name == "groq" and DEVANAGARI.search(text):
+            continue            # Orpheus sirf English bolta hai
         try:
             wav = fn(text)
             return Response(wav, mimetype="audio/wav")
