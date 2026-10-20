@@ -23,7 +23,20 @@ GROQ_BASE = "https://api.groq.com/openai/v1"
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3-turbo")
 WHISPER_LANG = os.environ.get("WHISPER_LANG", "en")
-LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+# LLM: jo model aapke Groq account me chale wahi use hoga (upar se neeche try karta hai).
+# Pasandida model force karna ho to Render env me LLM_MODEL=model-name daalo.
+_DEFAULT_LLMS = [
+    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3-32b",
+]
+LLM_MODELS = []
+for _m in [os.environ.get("LLM_MODEL", "").strip()] + _DEFAULT_LLMS:
+    if _m and _m not in LLM_MODELS:
+        LLM_MODELS.append(_m)
+working_model = None   # jo model chal gaya, usse yaad rakho
 
 # TTS: "edge" pehle, fail ho to "groq". Order badalna ho to env me TTS_ORDER=groq,edge
 TTS_ORDER = [p.strip() for p in os.environ.get("TTS_ORDER", "edge,groq").split(",") if p.strip()]
@@ -45,6 +58,7 @@ MAX_HISTORY = 6
 HALLUCINATIONS = {
     "thank you", "thanks", "thank you very much", "thanks for watching",
     "thank you for watching", "you", "bye", "bye bye", "okay", "ok", "hmm",
+    "the", "a", "i", "so", "uh", "um", "oh", "yeah",
 }
 
 
@@ -114,6 +128,48 @@ def tts_groq(text):
 PROVIDERS = {"edge": tts_edge, "groq": tts_groq}
 
 
+# ---------------- LLM with model fallback ----------------
+def call_llm(msgs):
+    """Models ko order me try karta hai. Return: (reply, error_text)"""
+    global working_model
+    order = ([working_model] if working_model else []) + \
+            [m for m in LLM_MODELS if m != working_model]
+    last = "no model tried"
+    for m in order:
+        payload = {"model": m, "messages": msgs, "temperature": 0.6, "max_tokens": 300}
+        if m.startswith("openai/gpt-oss"):
+            payload["reasoning_effort"] = "low"
+        try:
+            r = requests.post(
+                GROQ_BASE + "/chat/completions",
+                headers={"Authorization": "Bearer " + GROQ_KEY},
+                json=payload, timeout=25,
+            )
+        except requests.RequestException as e:
+            last = "%s: %s" % (m, e)
+            continue
+
+        if r.status_code == 200:
+            try:
+                content = r.json()["choices"][0]["message"].get("content") or ""
+            except Exception:
+                content = ""
+            reply = clean_text(content)
+            if reply:
+                working_model = m
+                return reply, ""
+            last = "%s: empty reply" % m
+            continue
+
+        last = "%s %d: %s" % (m, r.status_code, r.text[:200])
+        app.logger.warning("LLM %s", last)
+        if r.status_code == 401:       # galat API key - baaki models bhi fail honge
+            break
+        if working_model == m:
+            working_model = None
+    return None, last
+
+
 # ---------------- Routes ----------------
 @app.route("/", methods=["GET", "HEAD"])
 def root():
@@ -157,19 +213,9 @@ def ask():
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + history[-MAX_HISTORY:]
     msgs.append({"role": "user", "content": q})
 
-    r = requests.post(
-        GROQ_BASE + "/chat/completions",
-        headers={"Authorization": "Bearer " + GROQ_KEY},
-        json={"model": LLM_MODEL, "messages": msgs,
-              "temperature": 0.6, "max_tokens": 200},
-        timeout=60,
-    )
-    if r.status_code != 200:
-        return jsonify({"error": "llm failed", "details": r.text[:300]}), 502
-
-    reply = clean_text(r.json()["choices"][0]["message"]["content"] or "")
+    reply, err = call_llm(msgs)
     if not reply:
-        return jsonify({"error": "empty reply"}), 502
+        return jsonify({"error": "llm failed", "details": err}), 502
 
     history.append({"role": "user", "content": q})
     history.append({"role": "assistant", "content": reply})
