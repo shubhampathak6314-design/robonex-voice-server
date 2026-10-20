@@ -1,157 +1,203 @@
-from flask import Flask, request, jsonify, Response
+# ============================================================
+#  ROBONEX AI - voice server (Render)
+#  /            -> health check (server jagane ke liye)
+#  /transcribe  -> WAV audio (form field "audio") -> {"text": "..."}
+#  /ask         -> {"text": "..."} -> {"reply": "..."}
+#  /speak       -> {"text": "..."} -> WAV audio (16-bit mono)
+#  TTS: Edge TTS (free, no limit) + Groq Orpheus (fallback)
+# ============================================================
 import asyncio
+import io
 import os
+import re
 import subprocess
+import wave
 
-import edge_tts
-import imageio_ffmpeg
 import requests
+from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-GROQ_URL = "https://api.groq.com/openai/v1"
-CHAT_MODEL = "openai/gpt-oss-120b"
-STT_MODEL = "whisper-large-v3-turbo"
-TTS_VOICE = "hi-IN-SwaraNeural"
+
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_BASE = "https://api.groq.com/openai/v1"
+
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3-turbo")
+WHISPER_LANG = os.environ.get("WHISPER_LANG", "en")
+LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+
+# TTS: "edge" pehle, fail ho to "groq". Order badalna ho to env me TTS_ORDER=groq,edge
+TTS_ORDER = [p.strip() for p in os.environ.get("TTS_ORDER", "edge,groq").split(",") if p.strip()]
+EDGE_VOICE = os.environ.get("EDGE_VOICE", "en-US-AriaNeural")
+GROQ_TTS_MODEL = os.environ.get("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
+GROQ_TTS_VOICE = os.environ.get("GROQ_TTS_VOICE", "autumn")
+TTS_RATE = 24000   # ESP32 SPEAKER_RATE se match
+
+SYSTEM_PROMPT = (
+    "You are ROBONEX AI, a friendly voice assistant inside a small robot. "
+    "Answer in 1 to 3 short sentences, plain text only. "
+    "No markdown, no lists, no emojis, no asterisks."
+)
+
+history = []          # last few turns (ek hi device hai)
+MAX_HISTORY = 6
+
+# Whisper silence par aksar yahi bakwas likh deta hai - inhe ignore karo
+HALLUCINATIONS = {
+    "thank you", "thanks", "thank you very much", "thanks for watching",
+    "thank you for watching", "you", "bye", "bye bye", "okay", "ok", "hmm",
+}
 
 
-def groq_headers():
-    return {"Authorization": f"Bearer {GROQ_API_KEY}"}
+def _ffmpeg_exe():
+    import imageio_ffmpeg
+    return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def groq_error_response(feature, response):
-    app.logger.error("%s failed: HTTP %s - %s", feature, response.status_code, response.text[:2000])
-    return jsonify({"error": f"{feature} failed", "status": response.status_code,
-                    "details": response.text[:2000]}), 502
+def pcm_to_wav(pcm, rate):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
 
 
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({"assistant": "ROBONEX AI", "status": "online",
-                    "message": "ROBONEX AI Voice Server is running!", "tts": "Edge TTS",
-                    "endpoints": ["/", "/health", "/ask", "/transcribe", "/speak"]})
+def clean_text(s):
+    s = re.sub(r"<think>.*?</think>", " ", s, flags=re.S)
+    s = re.sub(r"[*#`_~]", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"assistant": "ROBONEX AI", "status": "online",
-                    "api_key_configured": bool(GROQ_API_KEY), "tts": "edge-tts"})
+# ---------------- TTS providers ----------------
+async def _edge_mp3(text):
+    import edge_tts
+    comm = edge_tts.Communicate(text, EDGE_VOICE)
+    buf = bytearray()
+    async for ch in comm.stream():
+        if ch["type"] == "audio":
+            buf += ch["data"]
+    return bytes(buf)
 
 
-@app.route("/ask", methods=["POST"])
-def ask():
-    if not GROQ_API_KEY:
-        return jsonify({"error": "GROQ_API_KEY is missing in Render environment"}), 500
-    data = request.get_json(silent=True) or {}
-    user_text = data.get("text", "")
-    if not isinstance(user_text, str) or not user_text.strip():
-        return jsonify({"error": "Please provide text"}), 400
-    try:
-        response = requests.post(
-            f"{GROQ_URL}/chat/completions",
-            headers={**groq_headers(), "Content-Type": "application/json"},
-            json={"model": CHAT_MODEL, "messages": [
-                {"role": "system", "content": "You are ROBONEX, a friendly AI robot assistant. Answer naturally, clearly, and concisely. Reply in Hindi or English according to the user's language."},
-                {"role": "user", "content": user_text.strip()}],
-                "max_completion_tokens": 300},
-            timeout=60)
-        if not response.ok:
-            return groq_error_response("Groq chat", response)
-        result = response.json()
-        answer = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return jsonify({"assistant": "ROBONEX AI", "reply": answer.strip()})
-    except requests.RequestException:
-        app.logger.exception("Groq chat connection failed")
-        return jsonify({"error": "Could not connect to Groq chat API"}), 502
-    except (ValueError, KeyError, IndexError, TypeError):
-        app.logger.exception("Invalid Groq chat response")
-        return jsonify({"error": "Invalid response received from Groq"}), 502
+def tts_edge(text):
+    mp3 = asyncio.run(_edge_mp3(text))
+    if not mp3:
+        raise RuntimeError("edge-tts returned no audio")
+    p = subprocess.run(
+        [_ffmpeg_exe(), "-hide_banner", "-loglevel", "error",
+         "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le",
+         "-ar", str(TTS_RATE), "-ac", "1", "pipe:1"],
+        input=mp3, capture_output=True, timeout=60,
+    )
+    if p.returncode != 0 or not p.stdout:
+        raise RuntimeError("ffmpeg failed: " + p.stderr.decode("utf-8", "ignore")[:200])
+    return pcm_to_wav(p.stdout, TTS_RATE)
+
+
+def tts_groq(text):
+    r = requests.post(
+        GROQ_BASE + "/audio/speech",
+        headers={"Authorization": "Bearer " + GROQ_KEY},
+        json={"model": GROQ_TTS_MODEL, "input": text,
+              "voice": GROQ_TTS_VOICE, "response_format": "wav"},
+        timeout=60,
+    )
+    if r.status_code != 200:
+        raise RuntimeError("groq tts %d: %s" % (r.status_code, r.text[:200]))
+    if r.content[:4] != b"RIFF":
+        raise RuntimeError("groq tts: not a WAV")
+    return r.content
+
+
+PROVIDERS = {"edge": tts_edge, "groq": tts_groq}
+
+
+# ---------------- Routes ----------------
+@app.route("/", methods=["GET", "HEAD"])
+def root():
+    return "ROBONEX server OK"
 
 
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
-    if not GROQ_API_KEY:
-        return jsonify({"error": "GROQ_API_KEY is missing in Render environment"}), 500
-    audio = request.files.get("audio")
-    if audio is None or not audio.filename:
-        return jsonify({"error": "Audio file is missing",
-                        "usage": "Send an audio file using multipart field 'audio'"}), 400
-    try:
-        response = requests.post(
-            f"{GROQ_URL}/audio/transcriptions",
-            headers=groq_headers(),
-            files={"file": (audio.filename, audio.stream, audio.mimetype or "application/octet-stream")},
-            data={"model": STT_MODEL, "response_format": "json"},
-            timeout=90)
-        if not response.ok:
-            return groq_error_response("Groq transcription", response)
-        result = response.json()
-        return jsonify({"assistant": "ROBONEX AI", "text": result.get("text", "").strip()})
-    except requests.RequestException:
-        app.logger.exception("Transcription connection failed")
-        return jsonify({"error": "Could not connect to Groq transcription API"}), 502
-    except (ValueError, TypeError):
-        app.logger.exception("Invalid transcription response")
-        return jsonify({"error": "Invalid transcription response"}), 502
+    f = request.files.get("audio")
+    if f is None:
+        return jsonify({"error": "no audio field"}), 400
+    data = f.read()
+    if len(data) < 1000:
+        return jsonify({"text": ""})
+
+    r = requests.post(
+        GROQ_BASE + "/audio/transcriptions",
+        headers={"Authorization": "Bearer " + GROQ_KEY},
+        files={"file": ("voice.wav", data, "audio/wav")},
+        data={"model": WHISPER_MODEL, "response_format": "json",
+              "language": WHISPER_LANG, "temperature": "0"},
+        timeout=60,
+    )
+    if r.status_code != 200:
+        return jsonify({"error": "stt failed", "details": r.text[:300]}), 502
+
+    text = (r.json().get("text") or "").strip()
+    norm = re.sub(r"[^a-z ]", "", text.lower()).strip()
+    if norm in HALLUCINATIONS:
+        text = ""
+    return jsonify({"text": text})
 
 
-async def edge_tts_mp3(text):
-    communicator = edge_tts.Communicate(text, TTS_VOICE)
-    chunks = []
-    async for chunk in communicator.stream():
-        if chunk.get("type") == "audio":
-            chunks.append(chunk["data"])
-    if not chunks:
-        raise RuntimeError("Edge TTS returned no audio")
-    return b"".join(chunks)
+@app.route("/ask", methods=["POST"])
+def ask():
+    body = request.get_json(force=True, silent=True) or {}
+    q = (body.get("text") or "").strip()
+    if not q:
+        return jsonify({"error": "empty text"}), 400
 
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + history[-MAX_HISTORY:]
+    msgs.append({"role": "user", "content": q})
 
-def mp3_to_wav(mp3_data):
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
-               "-f", "wav", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "24000", "pipe:1"]
-    result = subprocess.run(command, input=mp3_data, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, timeout=30, check=False)
-    if result.returncode != 0 or not result.stdout.startswith(b"RIFF"):
-        app.logger.error("MP3 to WAV conversion failed: %s",
-                         result.stderr.decode("utf-8", "replace")[:1000])
-        raise RuntimeError("Audio conversion failed")
-    return result.stdout
+    r = requests.post(
+        GROQ_BASE + "/chat/completions",
+        headers={"Authorization": "Bearer " + GROQ_KEY},
+        json={"model": LLM_MODEL, "messages": msgs,
+              "temperature": 0.6, "max_tokens": 200},
+        timeout=60,
+    )
+    if r.status_code != 200:
+        return jsonify({"error": "llm failed", "details": r.text[:300]}), 502
+
+    reply = clean_text(r.json()["choices"][0]["message"]["content"] or "")
+    if not reply:
+        return jsonify({"error": "empty reply"}), 502
+
+    history.append({"role": "user", "content": q})
+    history.append({"role": "assistant", "content": reply})
+    del history[:-MAX_HISTORY]
+    return jsonify({"reply": reply})
 
 
 @app.route("/speak", methods=["POST"])
 def speak():
-    data = request.get_json(silent=True) or {}
-    text_to_speak = data.get("text", "")
-    if not isinstance(text_to_speak, str) or not text_to_speak.strip():
-        return jsonify({"error": "Please provide text to speak"}), 400
-    try:
-        mp3_data = asyncio.run(edge_tts_mp3(text_to_speak.strip()[:200]))
-        wav_data = mp3_to_wav(mp3_data)
-        return Response(wav_data, status=200, content_type="audio/wav",
-                        headers={"Content-Disposition": 'inline; filename="robonex.wav"',
-                                 "Cache-Control": "no-store"})
-    except Exception:
-        app.logger.exception("Edge TTS generation/conversion failed")
-        return jsonify({"error": "Could not generate speech with Edge TTS",
-                        "hint": "Check Render logs and confirm edge-tts/imageio-ffmpeg installed successfully"}), 502
+    body = request.get_json(force=True, silent=True) or {}
+    text = clean_text(body.get("text") or "")[:400]
+    if not text:
+        return jsonify({"error": "empty text"}), 400
 
+    errors = []
+    for name in TTS_ORDER:
+        fn = PROVIDERS.get(name)
+        if not fn:
+            continue
+        try:
+            wav = fn(text)
+            return Response(wav, mimetype="audio/wav")
+        except Exception as e:
+            errors.append("%s: %s" % (name, e))
+            app.logger.warning("TTS %s failed: %s", name, e)
 
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({"error": "Endpoint not found"}), 404
-
-
-@app.errorhandler(405)
-def method_not_allowed(error):
-    return jsonify({"error": "HTTP method not allowed for this endpoint"}), 405
-
-
-@app.errorhandler(413)
-def file_too_large(error):
-    return jsonify({"error": "Uploaded file is too large"}), 413
+    return jsonify({"error": "all TTS failed", "details": errors}), 502
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
