@@ -24,6 +24,10 @@ GROQ_BASE = "https://api.groq.com/openai/v1"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
 # Khali = auto-detect (Hindi + English dono). Sirf Hindi: "hi", sirf English: "en"
 WHISPER_LANG = os.environ.get("WHISPER_LANG", "").strip()
+# Auto-detect me sirf ye bhasha maane jaate hain; baaki (jaise Russian) = galat detection
+ALLOWED_LANGS = {"en", "english", "hi", "hindi"}
+RETRY_LANG = os.environ.get("RETRY_LANG", "hi").strip() or "hi"
+last_audio = b""       # /last.wav se sunne ke liye (debug)
 # LLM: jo model aapke Groq account me chale wahi use hoga (upar se neeche try karta hai).
 # Pasandida model force karna ho to Render env me LLM_MODEL=model-name daalo.
 _DEFAULT_LLMS = [
@@ -134,11 +138,34 @@ def tts_groq(text):
 PROVIDERS = {"edge": tts_edge, "groq": tts_groq}
 
 
-def stt_fields():
-    d = {"model": WHISPER_MODEL, "response_format": "json", "temperature": "0"}
-    if WHISPER_LANG:
-        d["language"] = WHISPER_LANG
-    return d
+def run_stt(data, lang=None):
+    """Groq Whisper call. Return (json, error_text)"""
+    fields = {"model": WHISPER_MODEL, "response_format": "verbose_json", "temperature": "0"}
+    if lang:
+        fields["language"] = lang
+    try:
+        r = requests.post(
+            GROQ_BASE + "/audio/transcriptions",
+            headers={"Authorization": "Bearer " + GROQ_KEY},
+            files={"file": ("voice.wav", data, "audio/wav")},
+            data=fields, timeout=60,
+        )
+    except requests.RequestException as e:
+        return None, str(e)
+    if r.status_code != 200:
+        return None, "%d %s" % (r.status_code, r.text[:300])
+    return r.json(), ""
+
+
+def looks_like_noise(j):
+    """Whisper ke confidence numbers se pakadta hai ki ye bolna nahi, shor tha."""
+    segs = j.get("segments") or []
+    if not segs:
+        return False
+    if all((sg.get("no_speech_prob") or 0) > 0.7 for sg in segs):
+        return True
+    lp = [sg.get("avg_logprob") for sg in segs if sg.get("avg_logprob") is not None]
+    return bool(lp) and (sum(lp) / len(lp)) < -1.5
 
 
 # ---------------- LLM with model fallback ----------------
@@ -191,28 +218,44 @@ def root():
 
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
+    global last_audio
     f = request.files.get("audio")
     if f is None:
         return jsonify({"error": "no audio field"}), 400
     data = f.read()
+    last_audio = data
     if len(data) < 1000:
         return jsonify({"text": ""})
 
-    r = requests.post(
-        GROQ_BASE + "/audio/transcriptions",
-        headers={"Authorization": "Bearer " + GROQ_KEY},
-        files={"file": ("voice.wav", data, "audio/wav")},
-        data=stt_fields(),
-        timeout=60,
-    )
-    if r.status_code != 200:
-        return jsonify({"error": "stt failed", "details": r.text[:300]}), 502
+    j, err = run_stt(data, WHISPER_LANG or None)
+    if j is None:
+        return jsonify({"error": "stt failed", "details": err}), 502
 
-    text = (r.json().get("text") or "").strip()
+    lang = str(j.get("language") or "").lower()
+    if not WHISPER_LANG and lang and lang not in ALLOWED_LANGS:
+        app.logger.warning("STT detected %r (not allowed) -> retry with %s", lang, RETRY_LANG)
+        j2, err2 = run_stt(data, RETRY_LANG)
+        if j2 is None:
+            return jsonify({"error": "stt failed", "details": err2}), 502
+        j = j2
+
+    text = (j.get("text") or "").strip()
+    if looks_like_noise(j):
+        app.logger.info("STT rejected as noise: %r", text)
+        text = ""
     norm = re.sub(r"[^a-z ]", "", text.lower()).strip()
     if norm in HALLUCINATIONS:
         text = ""
+    app.logger.info("STT lang=%s text=%r", j.get("language"), text)
     return jsonify({"text": text})
+
+
+@app.route("/last.wav")
+def last_wav():
+    """Browser me kholo aur suno ki ESP32 mic ne kya record kiya."""
+    if not last_audio:
+        return "no audio yet", 404
+    return Response(last_audio, mimetype="audio/wav")
 
 
 @app.route("/ask", methods=["POST"])
