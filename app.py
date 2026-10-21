@@ -1,306 +1,184 @@
-# ============================================================
-#  ROBONEX AI - voice server (Render)
-#  /            -> health check (server jagane ke liye)
-#  /transcribe  -> WAV audio (form field "audio") -> {"text": "..."}
-#  /ask         -> {"text": "..."} -> {"reply": "..."}
-#  /speak       -> {"text": "..."} -> WAV audio (16-bit mono)
-#  TTS: Edge TTS (free, no limit) + Groq Orpheus (fallback)
-# ============================================================
-import asyncio
-import io
-import os
-import re
-import subprocess
-import wave
-
+import asyncio, io, os, re, subprocess, threading, wave
 import requests
 from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
-
-GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
+app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GROQ_BASE = "https://api.groq.com/openai/v1"
-
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
-# Khali = auto-detect (Hindi + English dono). Sirf Hindi: "hi", sirf English: "en"
 WHISPER_LANG = os.environ.get("WHISPER_LANG", "").strip()
-# Auto-detect me sirf ye bhasha maane jaate hain; baaki (jaise Russian) = galat detection
-ALLOWED_LANGS = {"en", "english", "hi", "hindi"}
 RETRY_LANG = os.environ.get("RETRY_LANG", "hi").strip() or "hi"
-last_audio = b""       # /last.wav se sunne ke liye (debug)
-# LLM: jo model aapke Groq account me chale wahi use hoga (upar se neeche try karta hai).
-# Pasandida model force karna ho to Render env me LLM_MODEL=model-name daalo.
-_DEFAULT_LLMS = [
-    "llama-3.1-8b-instant",
-    "llama-3.3-70b-versatile",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "openai/gpt-oss-20b",
-    "qwen/qwen3-32b",
-]
+ALLOWED_LANGS = {"en", "english", "hi", "hindi"}
+last_audio = b""
+audio_lock = threading.Lock()
+DEFAULT_LLMS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile",
+ "meta-llama/llama-4-scout-17b-16e-instruct", "openai/gpt-oss-20b", "qwen/qwen3-32b"]
 LLM_MODELS = []
-for _m in [os.environ.get("LLM_MODEL", "").strip()] + _DEFAULT_LLMS:
-    if _m and _m not in LLM_MODELS:
-        LLM_MODELS.append(_m)
-working_model = None   # jo model chal gaya, usse yaad rakho
-
-# TTS: "edge" pehle, fail ho to "groq". Order badalna ho to env me TTS_ORDER=groq,edge
-TTS_ORDER = [p.strip() for p in os.environ.get("TTS_ORDER", "edge,groq").split(",") if p.strip()]
+for m in [os.environ.get("LLM_MODEL", "").strip()] + DEFAULT_LLMS:
+    if m and m not in LLM_MODELS: LLM_MODELS.append(m)
+working_model = None
+TTS_ORDER = [x.strip().lower() for x in os.environ.get("TTS_ORDER", "edge,groq").split(",") if x.strip()]
 EDGE_VOICE = os.environ.get("EDGE_VOICE", "en-US-AriaNeural")
 HINDI_VOICE = os.environ.get("HINDI_VOICE", "hi-IN-SwaraNeural")
-DEVANAGARI = re.compile(r"[\u0900-\u097F]")
 GROQ_TTS_MODEL = os.environ.get("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
 GROQ_TTS_VOICE = os.environ.get("GROQ_TTS_VOICE", "autumn")
-TTS_RATE = 24000   # ESP32 SPEAKER_RATE se match
-
-SYSTEM_PROMPT = (
-    "You are ROBONEX AI, a friendly voice assistant inside a small robot. "
-    "Reply in the same language the user spoke. If the user speaks Hindi or Hinglish, "
-    "reply in Hindi written in Devanagari script. If the user speaks English, reply in English. "
-    "Answer in 1 to 3 short sentences, plain text only. "
-    "No markdown, no lists, no emojis, no asterisks."
-)
-
-history = []          # last few turns (ek hi device hai)
-MAX_HISTORY = 6
-
-# Whisper silence par aksar yahi bakwas likh deta hai - inhe ignore karo
-HALLUCINATIONS = {
-    "thank you", "thanks", "thank you very much", "thanks for watching",
-    "thank you for watching", "you", "bye", "bye bye", "okay", "ok", "hmm",
-    "the", "a", "i", "so", "uh", "um", "oh", "yeah",
-}
-
-
-def _ffmpeg_exe():
-    import imageio_ffmpeg
-    return imageio_ffmpeg.get_ffmpeg_exe()
-
-
-def pcm_to_wav(pcm, rate):
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(rate)
-        w.writeframes(pcm)
-    return buf.getvalue()
-
+TTS_RATE = 24000
+DEVANAGARI = re.compile(r"[\u0900-\u097F]")
+HALLUCINATIONS = {"thank you","thanks","thank you very much","thanks for watching","thank you for watching",
+ "you","bye","bye bye","okay","ok","hmm","the","a","i","so","uh","um","oh","yeah"}
+SYSTEM_PROMPT = ("You are ROBONEX AI, a friendly voice assistant inside a small robot. Reply in the same "
+ "language the user spoke. If Hindi or Hinglish, reply in Hindi written in Devanagari. If English, reply "
+ "in English. Answer in 1 to 3 short sentences, plain text only. No markdown, lists, emojis, or asterisks.")
+history, MAX_HISTORY = [], 6
+history_lock = threading.Lock()
 
 def clean_text(s):
-    s = re.sub(r"<think>.*?</think>", " ", s, flags=re.S)
-    s = re.sub(r"[*#`_~]", "", s)
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
+    s = re.sub(r"<think>.*?</think>", " ", str(s or ""), flags=re.S)
+    return re.sub(r"\s+", " ", re.sub(r"[*#`_~]", "", s)).strip()
 
+def pcm_to_wav(pcm, rate):
+    out = io.BytesIO()
+    with wave.open(out, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(pcm)
+    return out.getvalue()
 
-# ---------------- TTS providers ----------------
-async def _edge_mp3(text):
+async def edge_mp3(text):
     import edge_tts
     voice = HINDI_VOICE if DEVANAGARI.search(text) else EDGE_VOICE
-    comm = edge_tts.Communicate(text, voice)
-    buf = bytearray()
-    async for ch in comm.stream():
-        if ch["type"] == "audio":
-            buf += ch["data"]
-    return bytes(buf)
-
+    out = bytearray()
+    async for item in edge_tts.Communicate(text, voice).stream():
+        if item.get("type") == "audio": out.extend(item["data"])
+    return bytes(out)
 
 def tts_edge(text):
-    mp3 = asyncio.run(_edge_mp3(text))
-    if not mp3:
-        raise RuntimeError("edge-tts returned no audio")
-    p = subprocess.run(
-        [_ffmpeg_exe(), "-hide_banner", "-loglevel", "error",
-         "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le",
-         "-ar", str(TTS_RATE), "-ac", "1", "pipe:1"],
-        input=mp3, capture_output=True, timeout=60,
-    )
-    if p.returncode != 0 or not p.stdout:
-        raise RuntimeError("ffmpeg failed: " + p.stderr.decode("utf-8", "ignore")[:200])
+    import imageio_ffmpeg
+    mp3 = asyncio.run(edge_mp3(text))
+    if not mp3: raise RuntimeError("Edge TTS returned no audio")
+    p = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error",
+      "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ar", str(TTS_RATE),
+      "-ac", "1", "pipe:1"], input=mp3, capture_output=True, timeout=60)
+    if p.returncode or not p.stdout:
+        raise RuntimeError("ffmpeg failed: " + p.stderr.decode("utf-8","ignore")[:200])
     return pcm_to_wav(p.stdout, TTS_RATE)
 
-
 def tts_groq(text):
-    r = requests.post(
-        GROQ_BASE + "/audio/speech",
-        headers={"Authorization": "Bearer " + GROQ_KEY},
-        json={"model": GROQ_TTS_MODEL, "input": text,
-              "voice": GROQ_TTS_VOICE, "response_format": "wav"},
-        timeout=60,
-    )
-    if r.status_code != 200:
-        raise RuntimeError("groq tts %d: %s" % (r.status_code, r.text[:200]))
-    if r.content[:4] != b"RIFF":
-        raise RuntimeError("groq tts: not a WAV")
+    if not GROQ_KEY: raise RuntimeError("GROQ_API_KEY is not configured")
+    r = requests.post(GROQ_BASE+"/audio/speech", headers={"Authorization":"Bearer "+GROQ_KEY},
+      json={"model":GROQ_TTS_MODEL,"input":text,"voice":GROQ_TTS_VOICE,"response_format":"wav"}, timeout=60)
+    if r.status_code != 200: raise RuntimeError("Groq TTS %d: %s"%(r.status_code,r.text[:200]))
+    if not r.content.startswith(b"RIFF"): raise RuntimeError("Groq TTS did not return WAV")
     return r.content
 
-
-PROVIDERS = {"edge": tts_edge, "groq": tts_groq}
-
-
 def run_stt(data, lang=None):
-    """Groq Whisper call. Return (json, error_text)"""
-    fields = {"model": WHISPER_MODEL, "response_format": "verbose_json", "temperature": "0"}
-    if lang:
-        fields["language"] = lang
+    if not GROQ_KEY: return None, "GROQ_API_KEY is not configured in Render environment"
+    fields = {"model":WHISPER_MODEL,"response_format":"verbose_json","temperature":"0"}
+    if lang: fields["language"] = lang
     try:
-        r = requests.post(
-            GROQ_BASE + "/audio/transcriptions",
-            headers={"Authorization": "Bearer " + GROQ_KEY},
-            files={"file": ("voice.wav", data, "audio/wav")},
-            data=fields, timeout=60,
-        )
-    except requests.RequestException as e:
-        return None, str(e)
-    if r.status_code != 200:
-        return None, "%d %s" % (r.status_code, r.text[:300])
-    return r.json(), ""
-
+        r = requests.post(GROQ_BASE+"/audio/transcriptions", headers={"Authorization":"Bearer "+GROQ_KEY},
+          files={"file":("voice.wav",data,"audio/wav")}, data=fields, timeout=60)
+    except requests.RequestException as e: return None, str(e)
+    if r.status_code != 200: return None, "%d %s"%(r.status_code,r.text[:300])
+    try: return r.json(), ""
+    except ValueError: return None, "Whisper returned invalid JSON"
 
 def looks_like_noise(j):
-    """Whisper ke confidence numbers se pakadta hai ki ye bolna nahi, shor tha."""
     segs = j.get("segments") or []
-    if not segs:
-        return False
-    if all((sg.get("no_speech_prob") or 0) > 0.7 for sg in segs):
-        return True
-    lp = [sg.get("avg_logprob") for sg in segs if sg.get("avg_logprob") is not None]
-    return bool(lp) and (sum(lp) / len(lp)) < -1.5
+    if not segs: return False
+    if all((s.get("no_speech_prob") or 0) > .7 for s in segs): return True
+    lp = [s.get("avg_logprob") for s in segs if s.get("avg_logprob") is not None]
+    return bool(lp) and sum(lp)/len(lp) < -1.5
 
-
-# ---------------- LLM with model fallback ----------------
 def call_llm(msgs):
-    """Models ko order me try karta hai. Return: (reply, error_text)"""
     global working_model
-    order = ([working_model] if working_model else []) + \
-            [m for m in LLM_MODELS if m != working_model]
+    if not GROQ_KEY: return None, "GROQ_API_KEY is not configured in Render environment"
+    order = ([working_model] if working_model else []) + [m for m in LLM_MODELS if m != working_model]
     last = "no model tried"
     for m in order:
-        payload = {"model": m, "messages": msgs, "temperature": 0.6, "max_tokens": 300}
-        if m.startswith("openai/gpt-oss"):
-            payload["reasoning_effort"] = "low"
+        payload = {"model":m,"messages":msgs,"temperature":.6,"max_tokens":300}
+        if m.startswith("openai/gpt-oss"): payload["reasoning_effort"] = "low"
         try:
-            r = requests.post(
-                GROQ_BASE + "/chat/completions",
-                headers={"Authorization": "Bearer " + GROQ_KEY},
-                json=payload, timeout=25,
-            )
+            r = requests.post(GROQ_BASE+"/chat/completions", headers={"Authorization":"Bearer "+GROQ_KEY},
+                              json=payload, timeout=30)
         except requests.RequestException as e:
-            last = "%s: %s" % (m, e)
-            continue
-
+            last = f"{m}: {e}"; continue
         if r.status_code == 200:
-            try:
-                content = r.json()["choices"][0]["message"].get("content") or ""
-            except Exception:
-                content = ""
+            try: content = r.json()["choices"][0]["message"].get("content") or ""
+            except (ValueError,KeyError,IndexError,TypeError): content = ""
             reply = clean_text(content)
-            if reply:
-                working_model = m
-                return reply, ""
-            last = "%s: empty reply" % m
-            continue
-
-        last = "%s %d: %s" % (m, r.status_code, r.text[:200])
-        app.logger.warning("LLM %s", last)
-        if r.status_code == 401:       # galat API key - baaki models bhi fail honge
-            break
-        if working_model == m:
-            working_model = None
+            if reply: working_model = m; return reply, ""
+            last = f"{m}: empty reply"; continue
+        last = f"{m} {r.status_code}: {r.text[:220]}"
+        app.logger.warning("LLM request failed: %s", last)
+        if r.status_code == 401: break
+        if working_model == m: working_model = None
     return None, last
 
+@app.route("/", methods=["GET","HEAD"])
+def root(): return "ROBONEX server OK", 200
 
-# ---------------- Routes ----------------
-@app.route("/", methods=["GET", "HEAD"])
-def root():
-    return "ROBONEX server OK"
-
+@app.route("/health")
+def health():
+    return jsonify({"ok":True,"groq_key_configured":bool(GROQ_KEY),"stt_model":WHISPER_MODEL,"llm_models":LLM_MODELS})
 
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
     global last_audio
     f = request.files.get("audio")
-    if f is None:
-        return jsonify({"error": "no audio field"}), 400
+    if f is None: return jsonify({"error":"missing multipart field 'audio'"}), 400
     data = f.read()
-    last_audio = data
-    if len(data) < 1000:
-        return jsonify({"text": ""})
-
+    if len(data) < 1000: return jsonify({"text":""})
+    if not data.startswith(b"RIFF") or data[8:12] != b"WAVE":
+        return jsonify({"error":"audio must be a valid WAV file"}), 400
+    with audio_lock: last_audio = data
     j, err = run_stt(data, WHISPER_LANG or None)
-    if j is None:
-        return jsonify({"error": "stt failed", "details": err}), 502
-
+    if j is None: return jsonify({"error":"stt failed","details":err}), 502
     lang = str(j.get("language") or "").lower()
     if not WHISPER_LANG and lang and lang not in ALLOWED_LANGS:
-        app.logger.warning("STT detected %r (not allowed) -> retry with %s", lang, RETRY_LANG)
         j2, err2 = run_stt(data, RETRY_LANG)
-        if j2 is None:
-            return jsonify({"error": "stt failed", "details": err2}), 502
-        j = j2
-
+        if j2 is not None: j = j2
+        else: app.logger.warning("STT retry failed: %s", err2)
     text = (j.get("text") or "").strip()
-    if looks_like_noise(j):
-        app.logger.info("STT rejected as noise: %r", text)
-        text = ""
-    norm = re.sub(r"[^a-z ]", "", text.lower()).strip()
-    if norm in HALLUCINATIONS:
-        text = ""
-    app.logger.info("STT lang=%s text=%r", j.get("language"), text)
-    return jsonify({"text": text})
-
+    if looks_like_noise(j): text = ""
+    if re.sub(r"[^a-z ]","",text.lower()).strip() in HALLUCINATIONS: text = ""
+    app.logger.info("STT lang=%s text=%r",j.get("language"),text)
+    return jsonify({"text":text})
 
 @app.route("/last.wav")
 def last_wav():
-    """Browser me kholo aur suno ki ESP32 mic ne kya record kiya."""
-    if not last_audio:
-        return "no audio yet", 404
-    return Response(last_audio, mimetype="audio/wav")
-
+    with audio_lock: data = last_audio
+    if not data: return "No audio recorded yet", 404
+    return Response(data,mimetype="audio/wav")
 
 @app.route("/ask", methods=["POST"])
 def ask():
-    body = request.get_json(force=True, silent=True) or {}
+    body = request.get_json(silent=True) or {}
     q = (body.get("text") or "").strip()
-    if not q:
-        return jsonify({"error": "empty text"}), 400
-
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + history[-MAX_HISTORY:]
-    msgs.append({"role": "user", "content": q})
-
+    if not q: return jsonify({"error":"empty text"}), 400
+    with history_lock: msgs = [{"role":"system","content":SYSTEM_PROMPT}] + history[-MAX_HISTORY:] + [{"role":"user","content":q}]
     reply, err = call_llm(msgs)
-    if not reply:
-        return jsonify({"error": "llm failed", "details": err}), 502
-
-    history.append({"role": "user", "content": q})
-    history.append({"role": "assistant", "content": reply})
-    del history[:-MAX_HISTORY]
-    return jsonify({"reply": reply})
-
+    if not reply: return jsonify({"error":"llm failed","details":err}), 502
+    with history_lock:
+        history.extend([{"role":"user","content":q},{"role":"assistant","content":reply}])
+        del history[:-MAX_HISTORY]
+    return jsonify({"reply":reply})
 
 @app.route("/speak", methods=["POST"])
 def speak():
-    body = request.get_json(force=True, silent=True) or {}
-    text = clean_text(body.get("text") or "")[:400]
-    if not text:
-        return jsonify({"error": "empty text"}), 400
-
+    body = request.get_json(silent=True) or {}
+    text = clean_text(body.get("text",""))[:400]
+    if not text: return jsonify({"error":"empty text"}), 400
     errors = []
     for name in TTS_ORDER:
-        fn = PROVIDERS.get(name)
-        if not fn:
-            continue
-        if name == "groq" and DEVANAGARI.search(text):
-            continue            # Orpheus sirf English bolta hai
-        try:
-            wav = fn(text)
-            return Response(wav, mimetype="audio/wav")
+        fn = {"edge":tts_edge,"groq":tts_groq}.get(name)
+        if not fn or (name=="groq" and DEVANAGARI.search(text)): continue
+        try: return Response(fn(text),mimetype="audio/wav",headers={"Cache-Control":"no-store"})
         except Exception as e:
-            errors.append("%s: %s" % (name, e))
-            app.logger.warning("TTS %s failed: %s", name, e)
+            errors.append(f"{name}: {e}"); app.logger.warning("TTS %s failed: %s",name,e)
+    return jsonify({"error":"all TTS providers failed","details":errors}), 502
 
-    return jsonify({"error": "all TTS failed", "details": errors}), 502
-
+@app.errorhandler(413)
+def too_large(_e): return jsonify({"error":"audio upload too large"}), 413
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0",port=int(os.environ.get("PORT","5000")))
